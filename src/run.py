@@ -141,6 +141,7 @@ def run():
     success_count = 0
     consecutive_fails = 0
     is_collected = 0
+    last_heartbeat = time.time()
 
     # 准备开始（假设已经在旗点）
     logger.info("准备开始，请确保已站在旗点...")
@@ -155,6 +156,11 @@ def run():
 
         if not running:
             time.sleep(0.3)
+            # 心跳: 每 5 秒刷新 status.json, 防止 overlay_main 误判退出
+            now = time.time()
+            if now - last_heartbeat > 5:
+                overlay.update()
+                last_heartbeat = now
             continue
 
         # 连续失败过多 → 自尽重生
@@ -217,3 +223,5 @@ if __name__ == "__main__":
         logger.info("Ctrl+C 停止")
     except Exception as e:
         logger.exception(e)
+    finally:
+        overlay.stop()

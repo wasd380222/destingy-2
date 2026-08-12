@@ -1,23 +1,106 @@
 """
-overlay.py — 游戏内悬浮状态框 (纯 Win32 API, 零外部依赖)
+overlay.py — 游戏内悬浮状态框
 
-左上角小绿框，实时显示脚本运行状态。
-  - 穿透点击 (WS_EX_TRANSPARENT) — 不影响游戏操作
-  - 不抢焦点 (WS_EX_NOACTIVATE) — 不干扰 DirectInput
-  - 置顶显示 (WS_EX_TOPMOST) — 始终在游戏画面之上
-  - 颜色键透明 — 窗口背景透明，只显示绿框+文字
+架构:
+  run.py / directx.py  →  OverlayClient (写 JSON)  →  ./logs/overlay_status.json
+                                                              ↓ (300ms 轮询)
+  overlay_main.py  →  OverlayWindow (读 JSON, 渲染窗口)
 
-注意: 游戏需设置为「无边框窗口」模式，独占全屏下悬浮框不可见。
+OverlayClient  — 轻量, 供 run.py 进程内调用, 只写状态文件
+OverlayWindow  — 完整 Win32 窗口, 由 overlay_main.py 独立进程使用
+
+通信文件: ./logs/overlay_status.json
+  { "phase": str, "rounds": int, "success": int, "running": bool, "exit": bool }
+
+退出协议:
+  - 正常: run.py 退出前调 overlay.stop() → exit=true → overlay_main 检测后关闭
+  - 崩溃: status.json 超过 15 秒未更新 → overlay_main 自动退出
 """
+
+import json
+import os
+import time
+from pathlib import Path
+
+
+# 状态文件路径
+STATUS_PATH = Path("./logs/overlay_status.json")
+
+# 心跳超时 (秒) — 超过此时间 status.json 未更新则认为 run.py 已死
+HEARTBEAT_TIMEOUT = 15.0
+
+
+# ============================================================
+# OverlayClient — 状态发布端 (run.py 进程内使用)
+# ============================================================
+
+class OverlayClient:
+    """轻量客户端 — 只写 JSON 状态文件, 不创建窗口"""
+
+    def __init__(self):
+        self._state = {
+            "phase": "等待启动",
+            "rounds": 0,
+            "success": 0,
+            "running": False,
+            "exit": False,
+        }
+        self._started = False
+
+    def start(self):
+        """初始化状态文件 (仅一次)"""
+        if self._started:
+            return
+        self._started = True
+        try:
+            STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        self._write()
+
+    def update(self, phase=None, rounds=None, success=None, running=None):
+        """更新状态并写入文件 (每次调用都刷新 mtime, 兼作心跳)"""
+        if phase is not None:
+            self._state["phase"] = phase
+        if rounds is not None:
+            self._state["rounds"] = rounds
+        if success is not None:
+            self._state["success"] = success
+        if running is not None:
+            self._state["running"] = running
+        if self._started:
+            self._write()
+
+    def stop(self):
+        """通知 overlay_main 进程退出"""
+        self._state["exit"] = True
+        if self._started:
+            self._write()
+
+    def _write(self):
+        """原子写入: 先写 .tmp 再 rename, 防止读端读到半写数据"""
+        try:
+            tmp = STATUS_PATH.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._state, f, ensure_ascii=False)
+            os.replace(tmp, STATUS_PATH)
+        except Exception:
+            pass
+
+
+# 全局单例 (供 run.py / directx.py 使用)
+overlay = OverlayClient()
+
+
+# ============================================================
+# 以下为 OverlayWindow — 独立进程使用 (由 overlay_main.py 导入)
+# ============================================================
 
 import ctypes
 import ctypes.wintypes as wintypes
-import threading
 
 
-# ============================================================
-# Win32 常量
-# ============================================================
+# --- Win32 常量 ---
 WS_POPUP = 0x80000000
 WS_VISIBLE = 0x10000000
 WS_EX_LAYERED = 0x00080000
@@ -36,7 +119,6 @@ WM_DESTROY = 0x0002
 LWA_COLORKEY = 0x00000001
 
 TRANSPARENT = 1
-OPAQUE = 2
 
 DT_LEFT = 0x0000
 DT_TOP = 0x0000
@@ -54,22 +136,19 @@ PS_SOLID = 0
 TIMER_ID = 1
 TIMER_INTERVAL = 300  # ms
 
-# 颜色 (BGR format for Win32 COLORREF)
-COLOR_KEY = 0x00FF00FF      # 紫红色 — 透明色键
-COLOR_BG = 0x0018280D       # 深绿背景 #0D2818 (BGR)
-COLOR_BORDER = 0x0000CC00   # 亮绿边框 #00CC00 (BGR)
-COLOR_TEXT = 0x0066FF00     # 亮绿文字 #00FF66 (BGR)
+# 颜色 (BGR for COLORREF)
+COLOR_KEY = 0x00FF00FF      # 紫红 — 透明色键
+COLOR_BG = 0x0018280D       # 深绿背景 #0D2818
+COLOR_BORDER = 0x0000CC00   # 亮绿边框 #00CC00
+COLOR_TEXT = 0x0066FF00     # 亮绿文字 #00FF66
 
-# 窗口尺寸
 WIN_W = 260
 WIN_H = 72
 WIN_X = 10
 WIN_Y = 10
 
 
-# ============================================================
-# Win32 结构体
-# ============================================================
+# --- Win32 结构体 ---
 
 class WNDCLASSEXW(ctypes.Structure):
     _fields_ = [
@@ -99,21 +178,17 @@ class PAINTSTRUCT(ctypes.Structure):
     ]
 
 
-# WndProc 回调类型
 WNDPROC = ctypes.WINFUNCTYPE(
     ctypes.c_long, wintypes.HWND, wintypes.UINT,
     wintypes.WPARAM, wintypes.LPARAM
 )
 
 
-# ============================================================
-# 加载 Win32 库
-# ============================================================
+# --- 加载 Win32 库 ---
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
 kernel32 = ctypes.windll.kernel32
 
-# 设置函数签名
 user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
 user32.RegisterClassExW.restype = wintypes.ATOM
 
@@ -193,13 +268,9 @@ gdi32.SetTextColor.restype = wintypes.COLORREF
 gdi32.SetBkMode.argtypes = [wintypes.HDC, ctypes.c_int]
 gdi32.SetBkMode.restype = ctypes.c_int
 
-gdi32.SetBkColor.argtypes = [wintypes.HDC, wintypes.COLORREF]
-gdi32.SetBkColor.restype = wintypes.COLORREF
-
 gdi32.CreateSolidBrush.argtypes = [wintypes.COLORREF]
 gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
 
-# FillRect 和 DrawTextW 实际在 user32.dll
 user32.FillRect.argtypes = [wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH]
 user32.FillRect.restype = ctypes.c_int
 
@@ -216,63 +287,39 @@ gdi32.Rectangle.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_i
 gdi32.Rectangle.restype = wintypes.BOOL
 
 
-# ============================================================
-# Overlay 单例
-# ============================================================
+class OverlayWindow:
+    """悬浮框窗口 — 由 overlay_main.py 独立进程使用
 
-class Overlay:
-    """游戏内悬浮状态框"""
+    每 300ms 从 ./logs/overlay_status.json 读取状态并重绘。
+    检测到 exit=true 或心跳超时后自动关闭。
+    """
 
     def __init__(self):
-        self._phase = "等待启动"
-        self._rounds = 0
-        self._success = 0
-        self._running = False
-        self._lock = threading.Lock()
-        self._thread = None
-        self._started = False
+        self._state = {
+            "phase": "等待启动",
+            "rounds": 0,
+            "success": 0,
+            "running": False,
+            "exit": False,
+        }
+        # 文件 mtime (用于判断文件是否更新)
+        self._file_mtime = 0.0
+        # 心跳基准 (每次读到新文件时刷新为当前时间)
+        self._heartbeat = time.time()
         self._hwnd = None
         self._font = None
+        self._wnd_proc_ref = None
 
-    def start(self):
-        """启动悬浮框线程 (仅一次)"""
-        if self._started:
-            return
-        self._started = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def update(self, phase=None, rounds=None, success=None, running=None):
-        """线程安全更新状态"""
-        with self._lock:
-            if phase is not None:
-                self._phase = phase
-            if rounds is not None:
-                self._rounds = rounds
-            if success is not None:
-                self._success = success
-            if running is not None:
-                self._running = running
-
-    def _get_text(self):
-        """获取当前显示文本"""
-        with self._lock:
-            state = "● 运行中" if self._running else "○ 待命"
-            return f"{state}  R:{self._rounds}  OK:{self._success}\n{self._phase}"
-
-    def _run(self):
-        """悬浮框主线程 — 创建窗口并运行消息循环"""
+    def run(self):
+        """创建窗口并运行消息循环 (阻塞)"""
         class_name = "D2OverlayClass"
         window_name = "D2Overlay"
 
         hInstance = kernel32.GetModuleHandleW(None)
 
-        # 创建字体
         self._font = gdi32.CreateFontW(
-            15,           # nHeight
-            0, 0, 0,      # nWidth, nEscapement, nOrientation
-            FW_BOLD,      # fnWeight
-            0, 0, 0,      # fdwItalic, fdwUnderline, fdwStrikeOut
+            15, 0, 0, 0, FW_BOLD,
+            0, 0, 0,
             DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
@@ -281,12 +328,15 @@ class Overlay:
             "Consolas"
         )
 
-        # WndProc 回调
         def wnd_proc(hwnd, msg, wparam, lparam):
             if msg == WM_PAINT:
                 self._on_paint(hwnd)
                 return 0
             elif msg == WM_TIMER:
+                self._load_status()
+                if self._should_exit():
+                    user32.DestroyWindow(hwnd)
+                    return 0
                 user32.InvalidateRect(hwnd, None, False)
                 return 0
             elif msg == WM_DESTROY:
@@ -296,13 +346,11 @@ class Overlay:
 
         self._wnd_proc_ref = WNDPROC(wnd_proc)
 
-        # 注册窗口类
         wc = WNDCLASSEXW()
         wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
         wc.style = CS_HREDRAW | CS_VREDRAW
         wc.lpfnWndProc = ctypes.cast(self._wnd_proc_ref, ctypes.c_void_p)
         wc.hInstance = hInstance
-        # 窗口类背景设为深绿色 — WM_PAINT 时自动填充
         wc.hbrBackground = gdi32.CreateSolidBrush(COLOR_BG)
         wc.lpszClassName = class_name
 
@@ -310,7 +358,6 @@ class Overlay:
         if atom == 0:
             return
 
-        # 创建窗口
         ex_style = (WS_EX_LAYERED | WS_EX_TRANSPARENT |
                     WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
         style = WS_POPUP | WS_VISIBLE
@@ -320,16 +367,13 @@ class Overlay:
             WIN_X, WIN_Y, WIN_W, WIN_H,
             None, None, hInstance, None
         )
-
         if self._hwnd == 0:
             return
 
-        # 设置颜色键透明 — COLOR_KEY 变透明，其余不透明
         user32.SetLayeredWindowAttributes(
             self._hwnd, COLOR_KEY, 255, LWA_COLORKEY
         )
 
-        # 置顶
         HWND_TOPMOST = -1
         SWP_NOMOVE = 0x0002
         SWP_NOSIZE = 0x0001
@@ -339,22 +383,48 @@ class Overlay:
             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
         )
 
-        # 定时刷新
         user32.SetTimer(self._hwnd, TIMER_ID, TIMER_INTERVAL, None)
 
-        # 消息循环
+        # 首次加载状态
+        self._load_status()
+
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
+    def _load_status(self):
+        """从 JSON 文件加载状态 (mtime 变化时才读, 并刷新心跳)"""
+        try:
+            if not STATUS_PATH.exists():
+                return
+            mtime = STATUS_PATH.stat().st_mtime
+            if mtime == self._file_mtime:
+                return
+            self._file_mtime = mtime
+            self._heartbeat = time.time()  # 读到新文件 → 心跳重置
+            with open(STATUS_PATH, "r", encoding="utf-8") as f:
+                self._state = json.load(f)
+        except Exception:
+            pass
+
+    def _should_exit(self):
+        """检查是否应该退出"""
+        if self._state.get("exit", False):
+            return True
+        if time.time() - self._heartbeat > HEARTBEAT_TIMEOUT:
+            return True
+        return False
+
+    def _get_text(self):
+        state = "● 运行中" if self._state.get("running") else "○ 待命"
+        return f"{state}  R:{self._state.get('rounds', 0)}  OK:{self._state.get('success', 0)}\n{self._state.get('phase', '')}"
+
     def _on_paint(self, hwnd):
-        """WM_PAINT 处理 — 绘制绿框+文字"""
         ps = PAINTSTRUCT()
         hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
 
         try:
-            # 1. 用深绿画刷 + 亮绿画笔绘制填充矩形 (背景+边框一体)
             bg_brush = gdi32.CreateSolidBrush(COLOR_BG)
             border_pen = gdi32.CreatePen(PS_SOLID, 1, COLOR_BORDER)
 
@@ -368,7 +438,6 @@ class Overlay:
             gdi32.DeleteObject(bg_brush)
             gdi32.DeleteObject(border_pen)
 
-            # 2. 绘制文字
             old_font = gdi32.SelectObject(hdc, self._font)
             gdi32.SetTextColor(hdc, COLOR_TEXT)
             gdi32.SetBkMode(hdc, TRANSPARENT)
@@ -390,7 +459,3 @@ class Overlay:
             gdi32.SelectObject(hdc, old_font)
         finally:
             user32.EndPaint(hwnd, ctypes.byref(ps))
-
-
-# 全局单例
-overlay = Overlay()
