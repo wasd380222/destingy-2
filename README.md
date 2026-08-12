@@ -114,7 +114,6 @@ python src/run.py
 ## 调试
 
 - 在 `settings.toml` 中设置 `debug = true`，脚本会在 `./debug/` 目录保存每次检测的截图，方便校准参数
-- 录制输入回放：使用 `src/record.py` 录制自己的 .rec 文件解析鼠标/键盘时间戳
 
 ## 注意事项
 
