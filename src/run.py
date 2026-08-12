@@ -97,7 +97,6 @@ RESPAWN_WAIT_BONUS = 5.0
 def run():
     global running
 
-    from screenshot import is_boss_alive, is_player_alive
     from directx import (
         pre_ascension_sequence,
         set_abort,

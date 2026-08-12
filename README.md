@@ -84,8 +84,17 @@
 
 ## 安装
 
+> ⚠️ **第一次使用** 务必先跑一次 `install.bat` 创建 venv 并装依赖。
+
+**方法一：双击 install.bat（推荐）**
+- 自动创建项目内 `.venv` 虚拟环境
+- 自动 `pip install` 全部依赖（用清华镜像源加速）
+- 之后只用 `start.bat` 启动即可
+
+**方法二：手动**
 ```bash
-pip install -r requirements.txt
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
 ## 配置
@@ -98,7 +107,9 @@ pip install -r requirements.txt
 
 ## 运行
 
-双击 `start.bat`
+第一次运行：双击 `install.bat`
+
+之后每次：双击 `start.bat`
 
 f10 停止
 
