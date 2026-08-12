@@ -20,7 +20,7 @@
 
 - Python 3.11 ~ 3.13
 - Windows 10/11
-- 屏幕分辨率 1920×1080 或 2560×1440
+- 屏幕分辨率 1920×1080
 - 依赖：`pydirectinput`、`loguru`、`Pillow`（见 `requirements.txt`）
 
 ## 安装
@@ -34,7 +34,7 @@ pip install -r requirements.txt
 编辑 `settings.toml`：
 
 1. **[base]** — 按键绑定，按你在游戏里的设置修改
-2. **[1080p] / [1440p]** — 鼠标偏移量与时序参数，基于录制数据校准
+2. **[1080p]** — 鼠标偏移量与时序参数，基于录制数据校准
 3. 所有参数都可通过 `src/tuner.py` 在运行时用热键微调（F2/F3/F5/F6 增减，F1 显示当前值）
 
 ## 运行
