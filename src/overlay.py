@@ -20,14 +20,26 @@ OverlayWindow  — 完整 Win32 窗口, 由 overlay_main.py 独立进程使用
 import json
 import os
 import time
+import traceback
 from pathlib import Path
 
 
 # 状态文件路径
 STATUS_PATH = Path("./logs/overlay_status.json")
+ERROR_LOG = Path("./logs/overlay_error.log")
 
 # 心跳超时 (秒) — 超过此时间 status.json 未更新则认为 run.py 已死
 HEARTBEAT_TIMEOUT = 15.0
+
+
+def _log_error(msg):
+    """写错误日志 (追加模式)"""
+    try:
+        ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -292,6 +304,10 @@ class OverlayWindow:
 
     每 300ms 从 ./logs/overlay_status.json 读取状态并重绘。
     检测到 exit=true 或心跳超时后自动关闭。
+
+    关键修复:
+    - GDI 对象 (font/brush/pen) 在 run() 中创建一次, 消息循环结束后统一释放
+    - WndProc 回调整体 try/except, 任何异常写日志但不崩溃
     """
 
     def __init__(self):
@@ -302,21 +318,26 @@ class OverlayWindow:
             "running": False,
             "exit": False,
         }
-        # 文件 mtime (用于判断文件是否更新)
         self._file_mtime = 0.0
-        # 心跳基准 (每次读到新文件时刷新为当前时间)
         self._heartbeat = time.time()
         self._hwnd = None
+        # GDI 对象 — 在 run() 中创建, 循环结束后释放
         self._font = None
+        self._brush = None
+        self._pen = None
         self._wnd_proc_ref = None
+        self._class_brush = None  # 窗口类背景画刷 (注册时传入, 循环结束后释放)
 
     def run(self):
         """创建窗口并运行消息循环 (阻塞)"""
+        _log_error("OverlayWindow.run() 开始")
+
         class_name = "D2OverlayClass"
         window_name = "D2Overlay"
 
         hInstance = kernel32.GetModuleHandleW(None)
 
+        # --- 创建 GDI 对象 (仅一次) ---
         self._font = gdi32.CreateFontW(
             15, 0, 0, 0, FW_BOLD,
             0, 0, 0,
@@ -327,21 +348,31 @@ class OverlayWindow:
             FF_SWISS,
             "Consolas"
         )
+        self._brush = gdi32.CreateSolidBrush(COLOR_BG)
+        self._pen = gdi32.CreatePen(PS_SOLID, 1, COLOR_BORDER)
+        self._class_brush = gdi32.CreateSolidBrush(COLOR_BG)
+
+        if not self._font or not self._brush or not self._pen:
+            _log_error(f"GDI 对象创建失败: font={self._font} brush={self._brush} pen={self._pen}")
 
         def wnd_proc(hwnd, msg, wparam, lparam):
-            if msg == WM_PAINT:
-                self._on_paint(hwnd)
-                return 0
-            elif msg == WM_TIMER:
-                self._load_status()
-                if self._should_exit():
-                    user32.DestroyWindow(hwnd)
+            """WndProc — 所有异常在此捕获, 绝不让异常穿过 C 回调边界"""
+            try:
+                if msg == WM_PAINT:
+                    self._on_paint(hwnd)
                     return 0
-                user32.InvalidateRect(hwnd, None, False)
-                return 0
-            elif msg == WM_DESTROY:
-                user32.PostQuitMessage(0)
-                return 0
+                elif msg == WM_TIMER:
+                    self._load_status()
+                    if self._should_exit():
+                        user32.DestroyWindow(hwnd)
+                        return 0
+                    user32.InvalidateRect(hwnd, None, False)
+                    return 0
+                elif msg == WM_DESTROY:
+                    user32.PostQuitMessage(0)
+                    return 0
+            except Exception as e:
+                _log_error(f"WndProc 异常 (msg={msg}): {e}\n{traceback.format_exc()}")
             return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
         self._wnd_proc_ref = WNDPROC(wnd_proc)
@@ -351,11 +382,14 @@ class OverlayWindow:
         wc.style = CS_HREDRAW | CS_VREDRAW
         wc.lpfnWndProc = ctypes.cast(self._wnd_proc_ref, ctypes.c_void_p)
         wc.hInstance = hInstance
-        wc.hbrBackground = gdi32.CreateSolidBrush(COLOR_BG)
+        wc.hbrBackground = self._class_brush
         wc.lpszClassName = class_name
 
         atom = user32.RegisterClassExW(ctypes.byref(wc))
         if atom == 0:
+            err = kernel32.GetLastError()
+            _log_error(f"RegisterClassEx 失败, GetLastError={err}")
+            self._cleanup_gdi()
             return
 
         ex_style = (WS_EX_LAYERED | WS_EX_TRANSPARENT |
@@ -368,6 +402,9 @@ class OverlayWindow:
             None, None, hInstance, None
         )
         if self._hwnd == 0:
+            err = kernel32.GetLastError()
+            _log_error(f"CreateWindowEx 失败, GetLastError={err}")
+            self._cleanup_gdi()
             return
 
         user32.SetLayeredWindowAttributes(
@@ -387,11 +424,30 @@ class OverlayWindow:
 
         # 首次加载状态
         self._load_status()
+        _log_error("窗口创建成功, 进入消息循环")
 
         msg = wintypes.MSG()
-        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
+        try:
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as e:
+            _log_error(f"消息循环异常: {e}\n{traceback.format_exc()}")
+
+        _log_error("消息循环结束, 清理资源")
+        self._cleanup_gdi()
+        _log_error("OverlayWindow.run() 结束")
+
+    def _cleanup_gdi(self):
+        """释放所有 GDI 对象"""
+        for obj_attr in ("_font", "_brush", "_pen", "_class_brush"):
+            obj = getattr(self, obj_attr, None)
+            if obj:
+                try:
+                    gdi32.DeleteObject(obj)
+                except Exception:
+                    pass
+                setattr(self, obj_attr, None)
 
     def _load_status(self):
         """从 JSON 文件加载状态 (mtime 变化时才读, 并刷新心跳)"""
@@ -402,17 +458,18 @@ class OverlayWindow:
             if mtime == self._file_mtime:
                 return
             self._file_mtime = mtime
-            self._heartbeat = time.time()  # 读到新文件 → 心跳重置
+            self._heartbeat = time.time()
             with open(STATUS_PATH, "r", encoding="utf-8") as f:
                 self._state = json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            _log_error(f"_load_status 异常: {e}")
 
     def _should_exit(self):
         """检查是否应该退出"""
         if self._state.get("exit", False):
             return True
         if time.time() - self._heartbeat > HEARTBEAT_TIMEOUT:
+            _log_error(f"心跳超时: {time.time() - self._heartbeat:.1f}s > {HEARTBEAT_TIMEOUT}s")
             return True
         return False
 
@@ -421,41 +478,42 @@ class OverlayWindow:
         return f"{state}  R:{self._state.get('rounds', 0)}  OK:{self._state.get('success', 0)}\n{self._state.get('phase', '')}"
 
     def _on_paint(self, hwnd):
+        """绘制窗口内容 — 使用预创建的 GDI 对象, 不在 paint 中创建/销毁"""
         ps = PAINTSTRUCT()
         hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
+        if not hdc:
+            return
 
         try:
-            bg_brush = gdi32.CreateSolidBrush(COLOR_BG)
-            border_pen = gdi32.CreatePen(PS_SOLID, 1, COLOR_BORDER)
-
-            old_brush = gdi32.SelectObject(hdc, bg_brush)
-            old_pen = gdi32.SelectObject(hdc, border_pen)
-
+            # 用预创建的 brush + pen 画背景矩形
+            old_brush = gdi32.SelectObject(hdc, self._brush)
+            old_pen = gdi32.SelectObject(hdc, self._pen)
             gdi32.Rectangle(hdc, 0, 0, WIN_W, WIN_H)
-
             gdi32.SelectObject(hdc, old_brush)
             gdi32.SelectObject(hdc, old_pen)
-            gdi32.DeleteObject(bg_brush)
-            gdi32.DeleteObject(border_pen)
 
-            old_font = gdi32.SelectObject(hdc, self._font)
-            gdi32.SetTextColor(hdc, COLOR_TEXT)
-            gdi32.SetBkMode(hdc, TRANSPARENT)
+            # 绘制文字
+            if self._font:
+                old_font = gdi32.SelectObject(hdc, self._font)
+                gdi32.SetTextColor(hdc, COLOR_TEXT)
+                gdi32.SetBkMode(hdc, TRANSPARENT)
 
-            text = self._get_text()
+                text = self._get_text()
 
-            text_rect = wintypes.RECT()
-            text_rect.left = 8
-            text_rect.top = 5
-            text_rect.right = WIN_W - 8
-            text_rect.bottom = WIN_H - 5
+                text_rect = wintypes.RECT()
+                text_rect.left = 8
+                text_rect.top = 5
+                text_rect.right = WIN_W - 8
+                text_rect.bottom = WIN_H - 5
 
-            user32.DrawTextW(
-                hdc, text, -1,
-                ctypes.byref(text_rect),
-                DT_LEFT | DT_TOP | DT_NOCLIP
-            )
+                user32.DrawTextW(
+                    hdc, text, -1,
+                    ctypes.byref(text_rect),
+                    DT_LEFT | DT_TOP | DT_NOCLIP
+                )
 
-            gdi32.SelectObject(hdc, old_font)
+                gdi32.SelectObject(hdc, old_font)
+        except Exception as e:
+            _log_error(f"_on_paint 异常: {e}\n{traceback.format_exc()}")
         finally:
             user32.EndPaint(hwnd, ctypes.byref(ps))

@@ -1,5 +1,6 @@
 @echo off
 chcp 65001 >nul
+setlocal enabledelayedexpansion
 
 cd /d "%~dp0"
 
@@ -10,14 +11,15 @@ if not exist ".venv\Scripts\python.exe" (
 
     set PYEXE=
     where python >nul 2>&1 && set PYEXE=python
-    if "%PYEXE%"=="" where py >nul 2>&1 && set PYEXE=py -3
-    if "%PYEXE%"=="" (
+    if "!PYEXE!"=="" where py >nul 2>&1 && set PYEXE=py -3
+    if "!PYEXE!"=="" (
         echo   [X] 没找到 Python，请先安装 Python 3.11 ~ 3.13
+        echo       https://www.python.org/downloads/
         pause
         exit /b 1
     )
 
-    %PYEXE% -m venv .venv
+    !PYEXE! -m venv .venv
     if errorlevel 1 (
         echo   [X] 创建 venv 失败
         pause
