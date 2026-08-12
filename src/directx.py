@@ -27,6 +27,7 @@ from loguru import logger
 
 from size import get_resize
 from settings import monitor_settings, base_settings
+from overlay import overlay
 
 pydirectinput.PAUSE = 0
 
@@ -120,6 +121,7 @@ def pre_ascension_sequence():
       18.031         → X 飞升 (由 use_ascension() 执行)
     """
     logger.info("🎬 开始回放飞升前序列 (17.8s)...")
+    overlay.update(phase="回放飞升前序列...")
     global _abort
     _abort = False
 
@@ -237,6 +239,7 @@ def release_all_movement_keys():
 def use_ascension():
     """按X飞升 + 等待动画"""
     logger.info("🦅 X 飞升分身...")
+    overlay.update(phase="X飞升中...")
     press(base_settings.飞升按键)
     time.sleep(monitor_settings.飞升后等待)
     logger.success("分身已放置，Boss已开怪")
@@ -278,6 +281,7 @@ def post_ascension_combat():
       终结后等待         — G后等待
     """
     logger.info("⚔️ 飞升后战斗序列开始 (近战版)...")
+    overlay.update(phase="战斗序列开始...")
 
     start = time.monotonic()
 
@@ -291,6 +295,7 @@ def post_ascension_combat():
 
     # === S×2 后退定位 (0-0.594s) ===
     logger.info("🏃 S后退定位...")
+    overlay.update(phase="S后退定位")
     keyDown("s")
     at(0.188)
     keyUp("s")
@@ -301,6 +306,7 @@ def post_ascension_combat():
 
     # === ① 第一次ADS + 瞄准 + C近战 ===
     logger.info("🎯 ① 第一次ADS瞄准...")
+    overlay.update(phase="①ADS瞄准+近战")
     at(2.109)
     mouseDown(button=RIGHT)
 
@@ -328,10 +334,12 @@ def post_ascension_combat():
     # === ② 超能前瞄准 ===
     if monitor_settings.超能前瞄准偏移 != (0, 0):
         logger.info("🔧 ③ 超能前瞄准...")
+        overlay.update(phase="②超能前瞄准")
         turn_camera(monitor_settings.超能前瞄准偏移, step_px=10)
 
     # === F 超能 ===
     logger.info("🏹 释放虚空超能!")
+    overlay.update(phase="F释放超能")
     press(base_settings.超能按键)
 
     # === 超能后等待 → 冲刺 ===
@@ -339,6 +347,7 @@ def post_ascension_combat():
 
     # === 冲刺 + G终结 ===
     logger.info("💨 冲刺!")
+    overlay.update(phase="冲刺+G终结")
     keyDown("a")      # 侧移 (录制: A在W前125ms)
     time.sleep(monitor_settings.冲刺A时间)
     keyDown("w")
